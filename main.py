@@ -24,6 +24,8 @@ LAUNCH_REFRESH_HOURS = ((4.08, .25), (4.25, .50), (4.42, .25))
 # day. These weights approximate the early regions represented at the sync.
 REGIONAL_STARTS = ((-13.0, .04), (-10.5, .08), (-8.5, .18), (-5.5, .08),
                    (-2.5, .09), (-1.0, .34), (0.0, .15), (3.0, .04))
+PLAY_START_DELAYS = ((.25, .48), (1.50, .35), (3.50, .17))
+PROFILE_SCAN_DELAYS = ((.40, .30), (2.20, .45), (4.70, .25))
 
 # Approximate cumulative gameplay hours at mandatory story milestones.
 STORY_HOURS = {3: 12, 4: 21, 5: 39, 6: 55, 7: 62, 8: 15,
@@ -148,31 +150,39 @@ def trophy_prior(trophy):
 
 
 def allocate_unlocks(shares, total, rng):
-    """Round expected counts jointly, conserving the announced unlock budget."""
+    """Distribute the unlock budget with both shared and individual variation."""
     order = list(range(len(shares)))
     rng.shuffle(order)
     allocations = [0] * len(shares)
     remainder = rng.random()
+    independent = total // 2
     for index in order:
-        value = shares[index] * total + remainder
+        value = shares[index] * (total - independent) + remainder
         allocations[index] = integer = math.floor(value)
         remainder = value - integer
+    for index in rng.choices(order, weights=[shares[index] for index in order], k=independent):
+        allocations[index] += 1
     return allocations
 
 
 def launch_quantiles(trophies, rates, universal, priors, players, last_read, target, levels):
     """Forecast integer unlocks from complete profiles, partial profiles, and new play."""
+    nonuniversal = universal.count(False)
+    if nonuniversal == 0:
+        return [[100] * len(levels) for _ in rates]
+
     population = round(players * LAUNCH_PLAYER_GROWTH)
     extra = round((population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER)
     initial_counts = [round(rate * players / 100) for rate in rates]
     platinum = next((i for i, trophy in enumerate(trophies) if trophy['tier'] == 'platinum'), None)
     full_profiles = initial_counts[platinum] if platinum is not None else 0
-    nonuniversal = max(1, universal.count(False))
     max_complete = extra // nonuniversal if full_profiles else 0
     full_scenarios = ((0, .35), (max_complete, .65)) if max_complete else ((0, 1.0),)
     partial_weights = [0 if fixed or i == platinum else (max(0, count - full_profiles) + .35) ** .78
                        for i, (count, fixed) in enumerate(zip(initial_counts, universal))]
-    partial_total = sum(partial_weights) or 1.0
+    if not any(partial_weights):
+        partial_weights = [int(not fixed) for fixed in universal]
+    partial_total = sum(partial_weights)
     scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
                  if hour > last_read]
     if not scenarios:
@@ -180,18 +190,19 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
 
     masses = [defaultdict(float) for _ in rates]
     rng = Random(0)
-    draws = 40
+    draws = 200
     for hour, scenario_mass in scenarios:
         if hour > target:
             for rate, mass in zip(rates, masses):
                 mass[rate] += scenario_mass
             continue
 
-        # An estimated share of the group starts later than its store unlock.
-        cohorts = tuple((start + delay, region_weight * play_weight)
+        # Player starts and profile scans both shorten the usable play window.
+        cohorts = tuple((start + delay + scan, region_weight * play_weight * scan_weight)
                         for start, region_weight in REGIONAL_STARTS
-                        for delay, play_weight in ((.25, .48), (1.50, .35), (3.50, .17))
-                        if start + delay < hour)
+                        for delay, play_weight in PLAY_START_DELAYS
+                        for scan, scan_weight in PROFILE_SCAN_DELAYS
+                        if start + delay + scan < hour)
         play_weights = [0.0 if fixed or i == platinum else pursuit * eligible(cohorts, hour, effort, (8.0, .88, .82))
                         for i, (fixed, (effort, pursuit)) in enumerate(zip(universal, priors))]
         play_total = sum(play_weights)
