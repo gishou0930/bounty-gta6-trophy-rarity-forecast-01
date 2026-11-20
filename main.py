@@ -175,6 +175,8 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     extra = round((population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER)
     initial_counts = [round(rate * players / 100) for rate in rates]
     platinum = next((i for i, trophy in enumerate(trophies) if trophy['tier'] == 'platinum'), None)
+    story_order = sorted((i for i, trophy in enumerate(trophies) if trophy['id'] in STORY_HOURS),
+                         key=lambda i: STORY_HOURS[trophies[i]['id']])
     full_profiles = initial_counts[platinum] if platinum is not None else 0
     max_complete = extra // nonuniversal if full_profiles else 0
     full_scenarios = ((0, .35), (max_complete, .65)) if max_complete else ((0, 1.0),)
@@ -215,9 +217,14 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                 fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
                 for _ in range(draws):
                     increments = allocate_unlocks(fractions, remainder, rng)
-                    for i, (count, increase, fixed) in enumerate(zip(initial_counts, increments, universal)):
-                        earned = population if fixed else min(population, count + full_count + increase)
-                        masses[i][round(100 * earned / population, 2)] += weight
+                    earned = [population if fixed else min(population, count + full_count + increase)
+                              for count, increase, fixed in zip(initial_counts, increments, universal)]
+                    # A later mandatory mission needs every earlier milestone.
+                    ordered = sorted((earned[i] for i in story_order), reverse=True)
+                    for i, count in zip(story_order, ordered):
+                        earned[i] = count
+                    for mass, count in zip(masses, earned):
+                        mass[round(100 * count / population, 2)] += weight
 
     forecasts = []
     for mass in masses:
