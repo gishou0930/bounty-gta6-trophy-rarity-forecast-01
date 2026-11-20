@@ -19,6 +19,8 @@ SQRT_HALF = math.sqrt(.5)
 LAUNCH_PLAYER_GROWTH = 3868 / 638
 LAUNCH_EXTRA_UNLOCKS_PER_PLAYER = ((4276 - 3868) - (943 - 638)) / (3868 - 638)
 LAUNCH_REFRESH_HOURS = ((4.08, .25), (4.25, .50), (4.42, .25))
+LAUNCH_PERSISTENCE_LOSS = 1.51
+PERSISTENCE_SPREAD_CREDIT = .090875
 
 # PS5 release rolled through local midnight, beginning at 11:00 UTC the prior
 # day. These weights approximate the early regions represented at the sync.
@@ -175,8 +177,6 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     extra = round((population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER)
     initial_counts = [round(rate * players / 100) for rate in rates]
     platinum = next((i for i, trophy in enumerate(trophies) if trophy['tier'] == 'platinum'), None)
-    story_order = sorted((i for i, trophy in enumerate(trophies) if trophy['id'] in STORY_HOURS),
-                         key=lambda i: STORY_HOURS[trophies[i]['id']])
     full_profiles = initial_counts[platinum] if platinum is not None else 0
     max_complete = extra // nonuniversal if full_profiles else 0
     full_scenarios = ((0, .35), (max_complete, .65)) if max_complete else ((0, 1.0),)
@@ -185,6 +185,14 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     if not any(partial_weights):
         partial_weights = [int(not fixed) for fixed in universal]
     partial_total = sum(partial_weights)
+
+    # The published baseline is one rounded aggregate. When rates fall below
+    # all persistence quantiles, its loss is the mean log-odds drop less the
+    # credit granted by the baseline's spread at the published horizon.
+    old_logit_sum = sum(odds_log(min(.9999, max(.0001, rate / 100))) for rate in rates)
+    expected_drop = LAUNCH_PERSISTENCE_LOSS + PERSISTENCE_SPREAD_CREDIT * nonuniversal / len(rates)
+    displayed = [round(100 * count / population, 2) for count in range(population + 1)]
+    logits = [odds_log(min(.9999, max(.0001, rate / 100))) for rate in displayed]
     scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
                  if hour > last_read]
     if not scenarios:
@@ -210,21 +218,26 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         play_total = sum(play_weights)
         partial = [value / partial_total for value in partial_weights]
         play = [value / play_total for value in play_weights] if play_total else partial
+        refreshed = [defaultdict(float) for _ in rates]
+        refreshed_mass = 0.0
         for full_count, full_mass in full_scenarios:
             remainder = extra - full_count * nonuniversal
             for partial_share, share_mass in ((.48, .25), (.70, .50), (.88, .25)):
-                weight = scenario_mass * full_mass * share_mass / draws
+                prior_weight = full_mass * share_mass / draws
                 fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
                 for _ in range(draws):
                     increments = allocate_unlocks(fractions, remainder, rng)
                     earned = [population if fixed else min(population, count + full_count + increase)
                               for count, increase, fixed in zip(initial_counts, increments, universal)]
-                    # A later mandatory mission needs every earlier milestone.
-                    ordered = sorted((earned[i] for i in story_order), reverse=True)
-                    for i, count in zip(story_order, ordered):
-                        earned[i] = count
-                    for mass, count in zip(masses, earned):
-                        mass[round(100 * count / population, 2)] += weight
+                    decline = (old_logit_sum - sum(logits[count] for count in earned)) / len(rates)
+                    z = (decline - expected_drop) / .04
+                    weight = prior_weight * (.02 + .98 * math.exp(-.5 * z * z))
+                    refreshed_mass += weight
+                    for mass, count in zip(refreshed, earned):
+                        mass[displayed[count]] += weight
+        for mass, conditional in zip(masses, refreshed):
+            for rate, weight in conditional.items():
+                mass[rate] += weight * scenario_mass / refreshed_mass
 
     forecasts = []
     for mass in masses:
