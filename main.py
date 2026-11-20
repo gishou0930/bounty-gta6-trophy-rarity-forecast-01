@@ -3,15 +3,21 @@
 import json
 import math
 import os
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime
-from itertools import product
+from itertools import accumulate, product
 from pathlib import Path
 from statistics import median
 from typing import NamedTuple
 
 
 SQRT_HALF = math.sqrt(.5)
+
+# Published launch-refresh totals in the make.fun kit's competition.yaml.
+LAUNCH_PLAYER_GROWTH = 3868 / 638
+LAUNCH_EXTRA_UNLOCKS_PER_PLAYER = ((4276 - 3868) - (943 - 638)) / (3868 - 638)
+LAUNCH_REFRESH_HOURS = ((4.08, .25), (4.25, .50), (4.42, .25))
 
 # Approximate cumulative gameplay hours at mandatory story milestones.
 STORY_HOURS = {3: 12, 4: 21, 5: 39, 6: 55, 7: 62, 8: 15,
@@ -135,16 +141,51 @@ def trophy_prior(trophy):
     return SIDE_PRIORS.get(trophy_id, fallback)
 
 
-def launch_quantiles(rate, effort, pursuit, target, horizon, levels):
-    # The earliest tracked cohort is unusually experienced, and a fresh sync
-    # can dilute its rate even while the total number of unlocks increases.
-    fraction_early = (1 + .9 * max(0, target)) ** -1.12
-    cohort = ((max(0, target) * .42, 1.0),)
-    new_rate = pursuit * eligible(cohort, target, effort, (6.5, .90, .86))
-    refreshed = fraction_early * rate + (1 - fraction_early) * new_rate
-    stale_weight = .20 * math.exp(-horizon / 4)
-    return mixture_quantiles([(1 - stale_weight, odds_log(refreshed), .58),
-                              (stale_weight, odds_log(rate), .24)], levels)
+def launch_quantiles(rates, universal, priors, players, last_read, target, levels):
+    """Distribute the expected launch sync's unlocks over integer trophy counts."""
+    population = round(players * LAUNCH_PLAYER_GROWTH)
+    extra = (population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER
+    initial_counts = [round(rate * players / 100) for rate in rates]
+    reviewer_weights = [0.0 if fixed else math.sqrt(count + .5)
+                        for count, fixed in zip(initial_counts, universal)]
+    reviewer_total = sum(reviewer_weights) or 1.0
+    scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
+                 if hour > last_read]
+    if not scenarios:
+        scenarios = [(last_read + .5, .35), (last_read + 1.5, .65)]
+
+    masses = [defaultdict(float) for _ in rates]
+    for hour, scenario_mass in scenarios:
+        if hour > target:
+            for rate, mass in zip(rates, masses):
+                mass[rate] += scenario_mass
+            continue
+
+        # Early adopters get the longest play window before the first sync.
+        cohorts = ((0.0, .40), (.20 * hour, .28), (.45 * hour, .20), (.75 * hour, .12))
+        play_weights = [0.0 if fixed else pursuit * eligible(cohorts, hour, effort, (8.0, .88, .82))
+                        for fixed, (effort, pursuit) in zip(universal, priors)]
+        play_total = sum(play_weights)
+        for reviewer_share, share_mass in ((.54, .25), (.69, .50), (.84, .25)):
+            weight = scenario_mass * share_mass
+            for index, (count, fixed) in enumerate(zip(initial_counts, universal)):
+                if fixed:
+                    masses[index][100] += weight
+                    continue
+                reviewer_fraction = reviewer_weights[index] / reviewer_total
+                play_fraction = play_weights[index] / play_total if play_total else reviewer_fraction
+                expected = count + extra * (reviewer_share * reviewer_fraction + (1 - reviewer_share) * play_fraction)
+                lower = math.floor(expected)
+                upper_weight = expected - lower
+                masses[index][round(100 * min(lower, population) / population, 2)] += weight * (1 - upper_weight)
+                masses[index][round(100 * min(lower + 1, population) / population, 2)] += weight * upper_weight
+
+    forecasts = []
+    for mass in masses:
+        ordered = sorted(mass)
+        cumulative = list(accumulate(mass[rate] for rate in ordered))
+        forecasts.append([ordered[bisect_left(cumulative, level * cumulative[-1])] for level in levels])
+    return forecasts
 
 
 def observed_count(rate, snapshot):
@@ -208,35 +249,40 @@ def forecast(case):
     priors = [trophy_prior(trophy) for trophy in trophies]
     observations = [[(snap, snap.rates[index]) for snap in snapshots
                      if snap.rates[index] is not None] for index in range(len(trophies))]
-    seeds = [launch_seed(reads, first, latest) if reads else 0.0 for reads in observations]
+    universal = [bool(reads) and reads[-1][0].players >= 100 and all(rate == 100 for _, rate in reads)
+                 for reads in observations]
 
     launch_only = latest.hour <= 1 and checkpoint <= 12 and latest.players < 1.7 * first.players
-    if not launch_only:
-        usable = [i for i, snap in enumerate(snapshots) if snap.hour >= 3]
-        usable = usable or [len(snapshots) - 1]
-        stride = max(1, math.ceil(len(usable) / 7))
-        sample_indices = usable[::-stride]
-        samples = [(snapshots[index], arrivals(snapshots[:index + 1])) for index in sample_indices]
-        story = [(index, priors[index][0], seeds[index]) for index, trophy in enumerate(trophies)
-                 if trophy['id'] in STORY_HOURS]
-        paces = list(product((3.25, 4.8, 6.4, 8.1, 10.4), (.78, .96, 1.12), (.53, .75, .98)))
-        errors = [story_error(samples, story, pace) for pace in paces]
-        best_error = min(errors)
-        weights = [math.exp(-6 * (error - best_error)) for error in errors]
-        weight_total = sum(weights)
-        current = arrivals(snapshots)
-        futures = []
-        for growth, probability in ((.70, .25), (1.0, .50), (1.45, .25)):
-            future = current + projected_arrivals(snapshots, target, growth)
-            futures.append((future, sum(count for _, count in future), probability))
+    if launch_only:
+        last_read = elapsed_hours(case['history'][-1]['slot'], release)
+        rates = [reads[-1][1] if reads else 0.0 for reads in observations]
+        launch_rows = launch_quantiles(rates, universal, priors, latest.players, last_read, target, levels)
+        return {'trophies': [{'id': trophy['id'], 'q': quantiles}
+                             for trophy, quantiles in zip(trophies, launch_rows)]}
+
+    seeds = [launch_seed(reads, first, latest) if reads else 0.0 for reads in observations]
+    usable = [i for i, snap in enumerate(snapshots) if snap.hour >= 3]
+    usable = usable or [len(snapshots) - 1]
+    stride = max(1, math.ceil(len(usable) / 7))
+    sample_indices = usable[::-stride]
+    samples = [(snapshots[index], arrivals(snapshots[:index + 1])) for index in sample_indices]
+    story = [(index, priors[index][0], seeds[index]) for index, trophy in enumerate(trophies)
+             if trophy['id'] in STORY_HOURS]
+    paces = list(product((3.25, 4.8, 6.4, 8.1, 10.4), (.78, .96, 1.12), (.53, .75, .98)))
+    errors = [story_error(samples, story, pace) for pace in paces]
+    best_error = min(errors)
+    weights = [math.exp(-6 * (error - best_error)) for error in errors]
+    weight_total = sum(weights)
+    current = arrivals(snapshots)
+    futures = []
+    for growth, probability in ((.70, .25), (1.0, .50), (1.45, .25)):
+        future = current + projected_arrivals(snapshots, target, growth)
+        futures.append((future, sum(count for _, count in future), probability))
 
     output = []
-    for trophy, reads, (effort, pursuit), seed in zip(trophies, observations, priors, seeds):
-        if reads and reads[-1][0].players >= 100 and all(rate == 100 for _, rate in reads):
+    for trophy, reads, (effort, pursuit), seed, fixed in zip(trophies, observations, priors, seeds, universal):
+        if fixed:
             quantiles = [100] * len(levels)
-        elif launch_only:
-            last_rate = reads[-1][1] / 100 if reads else 0.0
-            quantiles = launch_quantiles(last_rate, effort, pursuit, target, horizon, levels)
         else:
             snap, rate = reads[-1] if reads else (latest, 0.0)
             successes = max(0, observed_count(rate, snap) - seed)
