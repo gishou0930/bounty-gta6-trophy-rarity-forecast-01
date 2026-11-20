@@ -6,6 +6,7 @@ import os
 from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime
+from functools import cache
 from itertools import accumulate, product
 from pathlib import Path
 from random import Random
@@ -20,7 +21,7 @@ LAUNCH_PLAYER_GROWTH = 3868 / 638
 LAUNCH_EXTRA_UNLOCKS_PER_PLAYER = ((4276 - 3868) - (943 - 638)) / (3868 - 638)
 LAUNCH_REFRESH_HOURS = ((4.08, .25), (4.25, .50), (4.42, .25))
 LAUNCH_PERSISTENCE_LOSS = 1.51
-PERSISTENCE_SPREAD_CREDIT = .090875
+PERSISTENCE_NORMAL_QUANTILES = (-1.645, -.674, 0, .674, 1.645)
 
 # PS5 release rolled through local midnight, beginning at 11:00 UTC the prior
 # day. These weights approximate the early regions represented at the sync.
@@ -74,6 +75,17 @@ def unique_snapshots(history, release):
 def odds_log(p):
     p = min(1 - 1e-7, max(1e-7, p))
     return math.log(p / (1 - p))
+
+
+def score_logit(rate):
+    return odds_log(min(99.99, max(.01, rate)) / 100)
+
+
+def persistence_logit(rate, normal_quantile):
+    spread = .5 * math.sqrt(90 / 1440)
+    shifted = score_logit(rate) + spread * normal_quantile
+    prediction = 100 / (1 + math.exp(-shifted))
+    return score_logit(math.floor(prediction * 10_000 + .5) / 10_000)
 
 
 def normal_cdf(z):
@@ -186,13 +198,17 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         partial_weights = [int(not fixed) for fixed in universal]
     partial_total = sum(partial_weights)
 
-    # The published baseline is one rounded aggregate. When rates fall below
-    # all persistence quantiles, its loss is the mean log-odds drop less the
-    # credit granted by the baseline's spread at the published horizon.
-    old_logit_sum = sum(odds_log(min(.9999, max(.0001, rate / 100))) for rate in rates)
-    expected_drop = LAUNCH_PERSISTENCE_LOSS + PERSISTENCE_SPREAD_CREDIT * nonuniversal / len(rates)
+    # Apply the published baseline formula for the documented 90-minute
+    # transition to each simulated allocation of the public aggregate count.
+    persistence = [tuple(persistence_logit(rate, z) for z in PERSISTENCE_NORMAL_QUANTILES) for rate in rates]
     displayed = [round(100 * count / population, 2) for count in range(population + 1)]
-    logits = [odds_log(min(.9999, max(.0001, rate / 100))) for rate in displayed]
+    logits = [score_logit(rate) for rate in displayed]
+
+    @cache
+    def baseline_cost(index, count):
+        errors = (logits[count] - quantile for quantile in persistence[index])
+        return sum(2 * max(level * error, (level - 1) * error)
+                   for level, error in zip(levels, errors))
     scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
                  if hour > last_read]
     if not scenarios:
@@ -229,9 +245,11 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                     increments = allocate_unlocks(fractions, remainder, rng)
                     earned = [population if fixed else min(population, count + full_count + increase)
                               for count, increase, fixed in zip(initial_counts, increments, universal)]
-                    decline = (old_logit_sum - sum(logits[count] for count in earned)) / len(rates)
-                    z = (decline - expected_drop) / .04
-                    weight = prior_weight * (.02 + .98 * math.exp(-.5 * z * z))
+                    loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / (len(rates) * len(levels))
+                    # The published 1.51 was rounded. Retain a small prior mass
+                    # outside that interval for model error in other launches.
+                    distance = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
+                    weight = prior_weight * (.004 + .996 * math.exp(-.5 * (distance / .010) ** 2))
                     refreshed_mass += weight
                     for mass, count in zip(refreshed, earned):
                         mass[displayed[count]] += weight
