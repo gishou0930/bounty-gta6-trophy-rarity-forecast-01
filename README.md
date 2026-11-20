@@ -12,6 +12,8 @@ Repeated page reads count as one snapshot. Growth in the tracked population esti
 
 When the tracker still shows its launch-night population, the model forecasts the first refresh in player counts. It calibrates the influx and total additional unlocks from the aggregate refresh figures published in the make.fun kit's `competition.yaml`. A newly tracked platinum holder contributes to every base trophy. Remaining unlocks come from partial early-access profiles and from new players who reach early objectives. The model rounds the counts jointly to preserve the total unlocks in each simulated refresh, then computes marginal rarity quantiles. [Official kit](https://make.fun/c/gta6-trophy-rarity-forecast-01/kit).
 
+PlayStation released the game at local midnight in each country. The first-refresh forecast estimates the playtime available from several regional launch windows and allows for players starting after their store unlocks. The regional shares are modeling assumptions. [PlayStation launch announcement](https://blog.playstation.com/2026/11/10/pre-load-grand-theft-auto-vi-on-ps5-starting-today/).
+
 The playtime priors are estimates informed by the order of missions and the prerequisites for optional trophies. The program combines different player-growth and progression scenarios with uncertainty in log odds, then rounds the resulting percentiles to the tracker’s precision. [Trophy roadmap](https://www.powerpyx.com/gta-6-grand-theft-auto-vi-trophy-guide-roadmap/), [mission order](https://www.powerpyx.com/gta-6-full-walkthrough-all-missions), [Exophase tracker](https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/).
 
 ## Run it
