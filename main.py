@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import accumulate, product
 from pathlib import Path
+from random import Random
 from statistics import median
 from typing import NamedTuple
 
@@ -141,20 +142,40 @@ def trophy_prior(trophy):
     return SIDE_PRIORS.get(trophy_id, fallback)
 
 
-def launch_quantiles(rates, universal, priors, players, last_read, target, levels):
-    """Distribute the expected launch sync's unlocks over integer trophy counts."""
+def allocate_unlocks(shares, total, rng):
+    """Round expected counts jointly, conserving the announced unlock budget."""
+    order = list(range(len(shares)))
+    rng.shuffle(order)
+    allocations = [0] * len(shares)
+    remainder = rng.random()
+    for index in order:
+        value = shares[index] * total + remainder
+        allocations[index] = integer = math.floor(value)
+        remainder = value - integer
+    return allocations
+
+
+def launch_quantiles(trophies, rates, universal, priors, players, last_read, target, levels):
+    """Forecast integer unlocks from complete profiles, partial profiles, and new play."""
     population = round(players * LAUNCH_PLAYER_GROWTH)
-    extra = (population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER
+    extra = round((population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER)
     initial_counts = [round(rate * players / 100) for rate in rates]
-    reviewer_weights = [0.0 if fixed else math.sqrt(count + .5)
-                        for count, fixed in zip(initial_counts, universal)]
-    reviewer_total = sum(reviewer_weights) or 1.0
+    platinum = next((i for i, trophy in enumerate(trophies) if trophy['tier'] == 'platinum'), None)
+    full_profiles = initial_counts[platinum] if platinum is not None else 0
+    nonuniversal = max(1, universal.count(False))
+    max_complete = extra // nonuniversal if full_profiles else 0
+    full_scenarios = ((0, .35), (max_complete, .65)) if max_complete else ((0, 1.0),)
+    partial_weights = [0 if fixed or i == platinum else (max(0, count - full_profiles) + .35) ** .78
+                       for i, (count, fixed) in enumerate(zip(initial_counts, universal))]
+    partial_total = sum(partial_weights) or 1.0
     scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
                  if hour > last_read]
     if not scenarios:
         scenarios = [(last_read + .5, .35), (last_read + 1.5, .65)]
 
     masses = [defaultdict(float) for _ in rates]
+    rng = Random(0)
+    draws = 40
     for hour, scenario_mass in scenarios:
         if hour > target:
             for rate, mass in zip(rates, masses):
@@ -163,22 +184,21 @@ def launch_quantiles(rates, universal, priors, players, last_read, target, level
 
         # Early adopters get the longest play window before the first sync.
         cohorts = ((0.0, .40), (.20 * hour, .28), (.45 * hour, .20), (.75 * hour, .12))
-        play_weights = [0.0 if fixed else pursuit * eligible(cohorts, hour, effort, (8.0, .88, .82))
-                        for fixed, (effort, pursuit) in zip(universal, priors)]
+        play_weights = [0.0 if fixed or i == platinum else pursuit * eligible(cohorts, hour, effort, (8.0, .88, .82))
+                        for i, (fixed, (effort, pursuit)) in enumerate(zip(universal, priors))]
         play_total = sum(play_weights)
-        for reviewer_share, share_mass in ((.54, .25), (.69, .50), (.84, .25)):
-            weight = scenario_mass * share_mass
-            for index, (count, fixed) in enumerate(zip(initial_counts, universal)):
-                if fixed:
-                    masses[index][100] += weight
-                    continue
-                reviewer_fraction = reviewer_weights[index] / reviewer_total
-                play_fraction = play_weights[index] / play_total if play_total else reviewer_fraction
-                expected = count + extra * (reviewer_share * reviewer_fraction + (1 - reviewer_share) * play_fraction)
-                lower = math.floor(expected)
-                upper_weight = expected - lower
-                masses[index][round(100 * min(lower, population) / population, 2)] += weight * (1 - upper_weight)
-                masses[index][round(100 * min(lower + 1, population) / population, 2)] += weight * upper_weight
+        partial = [value / partial_total for value in partial_weights]
+        play = [value / play_total for value in play_weights] if play_total else partial
+        for full_count, full_mass in full_scenarios:
+            remainder = extra - full_count * nonuniversal
+            for partial_share, share_mass in ((.48, .25), (.70, .50), (.88, .25)):
+                weight = scenario_mass * full_mass * share_mass / draws
+                fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
+                for _ in range(draws):
+                    increments = allocate_unlocks(fractions, remainder, rng)
+                    for i, (count, increase, fixed) in enumerate(zip(initial_counts, increments, universal)):
+                        earned = population if fixed else min(population, count + full_count + increase)
+                        masses[i][round(100 * earned / population, 2)] += weight
 
     forecasts = []
     for mass in masses:
@@ -256,7 +276,7 @@ def forecast(case):
     if launch_only:
         last_read = elapsed_hours(case['history'][-1]['slot'], release)
         rates = [reads[-1][1] if reads else 0.0 for reads in observations]
-        launch_rows = launch_quantiles(rates, universal, priors, latest.players, last_read, target, levels)
+        launch_rows = launch_quantiles(trophies, rates, universal, priors, latest.players, last_read, target, levels)
         return {'trophies': [{'id': trophy['id'], 'q': quantiles}
                              for trophy, quantiles in zip(trophies, launch_rows)]}
 
