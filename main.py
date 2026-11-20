@@ -35,6 +35,14 @@ PROFILE_SCAN_DELAYS = ((.40, .30), (2.20, .45), (4.70, .25))
 STORY_HOURS = {3: 12, 4: 21, 5: 39, 6: 55, 7: 62, 8: 15,
                9: 34, 10: 42, 11: 46, 12: 49, 13: 58}
 
+# A later trophy cannot normally be earned before the named chapter gate.
+CHAPTER_PREREQUISITES = {
+    3: (4, 8, 24, 29, 33, 34, 47, 54, 55),
+    4: (5, 9, 22, 26, 27, 39, 49, 52),
+    5: (6, 10, 11, 12, 40),
+    6: (7, 13),
+}
+
 # Optional trophy priors: effective effort in gameplay hours and the chance of
 # pursuing it after enough playtime. See the README for how these are used.
 SIDE_PRIORS = {
@@ -164,20 +172,58 @@ def trophy_prior(trophy):
     return SIDE_PRIORS.get(trophy_id, fallback)
 
 
-def allocate_unlocks(shares, total, rng):
-    """Distribute the unlock budget with both shared and individual variation."""
-    order = list(range(len(shares)))
-    rng.shuffle(order)
-    allocations = [0] * len(shares)
-    remainder = rng.random()
-    independent = total // 2
-    for index in order:
-        value = shares[index] * (total - independent) + remainder
-        allocations[index] = integer = math.floor(value)
-        remainder = value - integer
-    for index in rng.choices(order, weights=[shares[index] for index in order], k=independent):
-        allocations[index] += 1
-    return allocations
+def condition_allocations(shares, total, fit, rng):
+    """Sample a count posterior and measure evidence under the scenario's prior."""
+    active = [i for i, share in enumerate(shares) if share > 0]
+    if total == 0:
+        counts = [0] * len(shares)
+        return fit(counts)[0], [counts]
+    if len(active) == 1:
+        counts = [0] * len(shares)
+        counts[active[0]] = total
+        return fit(counts)[0], [counts]
+
+    reserve = [math.floor(total * .5 * share) for share in shares]
+    free = total - sum(reserve)
+    relative_weights = [shares[i] for i in active]
+    initial_samples, initial_fit = [], []
+    prior_mass = 0.0
+    for _ in range(256):
+        counts = reserve.copy()
+        for i in rng.choices(active, weights=relative_weights, k=free):
+            counts[i] += 1
+        initial_samples.append(counts)
+        observed_fit, prior_fit = fit(counts)
+        prior_mass += prior_fit
+        initial_fit.append(observed_fit * prior_fit)
+
+    # The chapter constraints belong to the prior over allocations within a
+    # cohort scenario. Normalize that prior before comparing evidence across
+    # different cohort scenarios.
+    evidence = sum(initial_fit) / prior_mass
+    posterior = []
+    for start_index in rng.choices(range(len(initial_samples)), weights=initial_fit, k=8):
+        counts = initial_samples[start_index].copy()
+        current_fit = initial_fit[start_index]
+        for step in range(64):
+            donor, receiver = rng.sample(active, 2)
+            movable = counts[donor] - reserve[donor]
+            if movable:
+                proposal = counts.copy()
+                proposal[donor] -= 1
+                proposal[receiver] += 1
+                observed_fit, prior_fit = fit(proposal)
+                proposed_fit = observed_fit * prior_fit
+                receiver_free = counts[receiver] - reserve[receiver]
+                # The exchange is symmetric. The ratio includes the
+                # multinomial count factors and the published summaries.
+                numerator = proposed_fit * movable * shares[receiver]
+                denominator = current_fit * (receiver_free + 1) * shares[donor]
+                if rng.random() * denominator < numerator:
+                    counts, current_fit = proposal, proposed_fit
+            if step >= 16 and step % 4 == 0:
+                posterior.append(counts)
+    return evidence, posterior
 
 
 def aggregate_bounds(costs_by_trophy, total):
@@ -238,6 +284,11 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     if not any(partial_weights):
         partial_weights = [int(not fixed) for fixed in universal]
     partial_total = sum(partial_weights)
+    index_by_id = {trophy['id']: i for i, trophy in enumerate(trophies)}
+    prerequisites = [(index_by_id[chapter], index_by_id[trophy])
+                     for chapter, dependent in CHAPTER_PREREQUISITES.items()
+                     if chapter in index_by_id
+                     for trophy in dependent if trophy in index_by_id]
 
     # Apply the published baseline formula for the documented 90-minute
     # transition to each simulated allocation of the public aggregate count.
@@ -272,7 +323,6 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
 
     masses = [defaultdict(float) for _ in rates]
     rng = Random(0)
-    draws = 340
     for hour, scenario_mass in scenarios:
         if hour > target:
             for rate, mass in zip(rates, masses):
@@ -293,22 +343,28 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         refreshed = [defaultdict(float) for _ in rates]
         refreshed_mass = 0.0
         for initial, remainder, cohort_mass in cohort_scenarios:
+            def fit(increments):
+                earned = [min(population, count + increase) for count, increase in zip(initial, increments)]
+                loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / score_scale
+                miss = sum(abs(rate - displayed[count]) for rate, count in zip(rates, earned)) / len(rates)
+                loss_gap = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
+                miss_gap = max(0.0, abs(miss - LAUNCH_PERSISTENCE_MISS) - .005)
+                above_band_floor = any(logits[count] >= persistence[i][0] for i, count in enumerate(earned)
+                                       if not universal[i])
+                out_of_order = sum(max(0, earned[trophy] - earned[chapter])
+                                   for chapter, trophy in prerequisites)
+                fit = math.exp(-.5 * ((loss_gap / .008) ** 2 + (miss_gap / .004) ** 2))
+                aggregate_fit = .002 + .998 * fit * (.04 if above_band_floor else 1.0)
+                # Keep a small allowance for inconsistent tracker scans.
+                return aggregate_fit, .02 + .98 * math.exp(-1.5 * out_of_order)
+
             for partial_share, share_mass in ((.28, .14), (.48, .24), (.68, .37), (.88, .25)):
-                prior_weight = cohort_mass * share_mass / draws
                 fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
-                for _ in range(draws):
-                    increments = allocate_unlocks(fractions, remainder, rng)
+                evidence, draws = condition_allocations(fractions, remainder, fit, rng)
+                weight = cohort_mass * share_mass * evidence / len(draws)
+                refreshed_mass += weight * len(draws)
+                for increments in draws:
                     earned = [min(population, count + increase) for count, increase in zip(initial, increments)]
-                    loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / score_scale
-                    miss = sum(abs(rate - displayed[count]) for rate, count in zip(rates, earned)) / len(rates)
-                    loss_gap = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
-                    miss_gap = max(0.0, abs(miss - LAUNCH_PERSISTENCE_MISS) - .005)
-                    # Every non-universal rate fell outside the persistence band.
-                    above_band_floor = any(logits[count] >= persistence[i][0] for i, count in enumerate(earned)
-                                           if not universal[i])
-                    fit = math.exp(-.5 * ((loss_gap / .008) ** 2 + (miss_gap / .004) ** 2))
-                    weight = prior_weight * (.002 + .998 * fit * (.04 if above_band_floor else 1.0))
-                    refreshed_mass += weight
                     for mass, count in zip(refreshed, earned):
                         mass[displayed[count]] += weight
         for mass, conditional in zip(masses, refreshed):
