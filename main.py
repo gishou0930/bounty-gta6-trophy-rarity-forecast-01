@@ -180,11 +180,35 @@ def allocate_unlocks(shares, total, rng):
     return allocations
 
 
+def aggregate_bounds(costs_by_trophy, total):
+    """Find the exact extremes under an integer award budget."""
+    minimum = [0.0] + [math.inf] * total
+    maximum = [0.0] + [-math.inf] * total
+    for costs in costs_by_trophy:
+        next_minimum = [math.inf] * (total + 1)
+        next_maximum = [-math.inf] * (total + 1)
+        for spent, (low, high) in enumerate(zip(minimum, maximum)):
+            if low == math.inf:
+                continue
+            for added, cost in enumerate(costs[:total - spent + 1]):
+                new_spent = spent + added
+                next_minimum[new_spent] = min(next_minimum[new_spent], low + cost)
+                next_maximum[new_spent] = max(next_maximum[new_spent], high + cost)
+        minimum, maximum = next_minimum, next_maximum
+    return minimum[-1], maximum[-1]
+
+
 def launch_quantiles(trophies, rates, universal, priors, players, last_read, target, levels):
     """Forecast integer unlocks from complete profiles, partial profiles, and new play."""
     nonuniversal = universal.count(False)
     if nonuniversal == 0:
         return [[100] * len(levels) for _ in rates]
+    scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
+                 if hour > last_read]
+    if not scenarios:
+        scenarios = [(last_read + .5, .35), (last_read + 1.5, .65)]
+    if all(hour > target for hour, _ in scenarios):
+        return [[rate] * len(levels) for rate in rates]
 
     population = round(players * LAUNCH_PLAYER_GROWTH)
     extra = round((population - players) * LAUNCH_EXTRA_UNLOCKS_PER_PLAYER)
@@ -192,9 +216,25 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     platinum = next((i for i, trophy in enumerate(trophies) if trophy['tier'] == 'platinum'), None)
     full_profiles = initial_counts[platinum] if platinum is not None else 0
     max_complete = extra // nonuniversal if full_profiles else 0
-    full_scenarios = ((0, .35), (max_complete, .65)) if max_complete else ((0, 1.0),)
-    partial_weights = [0 if fixed or i == platinum else (max(0, count - full_profiles) + .35) ** .78
-                       for i, (count, fixed) in enumerate(zip(initial_counts, universal))]
+    full_scenarios = [(0, .35), (max_complete, .65)] if max_complete else [(0, 1.0)]
+    if full_profiles and all(count > 0 for count, fixed in zip(initial_counts, universal) if not fixed):
+        # The set of ranked profiles can change as the tracker refreshes.
+        full_scenarios = [(change, .92 * weight) for change, weight in full_scenarios] + [(-1, .08)]
+
+    story_indices = {i for i, trophy in enumerate(trophies) if trophy['id'] in STORY_HOURS and not universal[i]}
+    can_add_story_profile = bool(story_indices and all(initial_counts[i] > full_profiles for i in story_indices))
+    cohort_scenarios = []
+    for full_change, full_weight in full_scenarios:
+        after_full = extra - full_change * nonuniversal
+        story_scenarios = ((0, .60), (1, .40)) if can_add_story_profile and after_full >= len(story_indices) else ((0, 1.0),)
+        for story_change, story_weight in story_scenarios:
+            start = [population if fixed else min(population, count + full_change + (story_change if i in story_indices else 0))
+                     for i, (count, fixed) in enumerate(zip(initial_counts, universal))]
+            cohort_scenarios.append((start, after_full - story_change * len(story_indices), full_weight * story_weight))
+
+    partial_weights = [0 if fixed or i == platinum else
+                       (max(0, count - full_profiles) + .35) ** .78 / math.sqrt(1 + effort / 45)
+                       for i, (count, fixed, (effort, _)) in enumerate(zip(initial_counts, universal, priors))]
     if not any(partial_weights):
         partial_weights = [int(not fixed) for fixed in universal]
     partial_total = sum(partial_weights)
@@ -210,14 +250,29 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         errors = (logits[count] - quantile for quantile in persistence[index])
         return sum(2 * max(level * error, (level - 1) * error)
                    for level, error in zip(levels, errors))
-    scenarios = [(hour, probability) for hour, probability in LAUNCH_REFRESH_HOURS
-                 if hour > last_read]
-    if not scenarios:
-        scenarios = [(last_read + .5, .35), (last_read + 1.5, .65)]
+
+    # The published zero coverage and rate declines cap each non-universal
+    # count below the baseline's lower quantile. Exclude cohort assignments
+    # whose best or worst feasible aggregate misses the published interval.
+    caps = [population if fixed else bisect_left(logits, row[0]) - 1
+            for fixed, row in zip(universal, persistence)]
+    score_scale = len(rates) * len(levels)
+    feasible = []
+    for initial, remainder, weight in cohort_scenarios:
+        costs = []
+        for i, (first, cap) in enumerate(zip(initial, caps)):
+            last = min(cap, first if i == platinum else first + remainder)
+            costs.append(tuple(baseline_cost(i, count) for count in range(first, last + 1)))
+        low, high = aggregate_bounds(costs, remainder)
+        if (high / score_scale >= LAUNCH_PERSISTENCE_LOSS - .005
+                and low / score_scale < LAUNCH_PERSISTENCE_LOSS + .005):
+            feasible.append((initial, remainder, weight))
+    if feasible:
+        cohort_scenarios = feasible
 
     masses = [defaultdict(float) for _ in rates]
     rng = Random(0)
-    draws = 650
+    draws = 340
     for hour, scenario_mass in scenarios:
         if hour > target:
             for rate, mass in zip(rates, masses):
@@ -237,18 +292,15 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         play = [value / play_total for value in play_weights] if play_total else partial
         refreshed = [defaultdict(float) for _ in rates]
         refreshed_mass = 0.0
-        for full_count, full_mass in full_scenarios:
-            remainder = extra - full_count * nonuniversal
+        for initial, remainder, cohort_mass in cohort_scenarios:
             for partial_share, share_mass in ((.28, .14), (.48, .24), (.68, .37), (.88, .25)):
-                prior_weight = full_mass * share_mass / draws
+                prior_weight = cohort_mass * share_mass / draws
                 fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
                 for _ in range(draws):
                     increments = allocate_unlocks(fractions, remainder, rng)
-                    earned = [population if fixed else min(population, count + full_count + increase)
-                              for count, increase, fixed in zip(initial_counts, increments, universal)]
-                    loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / (len(rates) * len(levels))
-                    changes = [abs(rate - displayed[count]) for rate, count in zip(rates, earned)]
-                    miss = sum(changes) / len(rates)
+                    earned = [min(population, count + increase) for count, increase in zip(initial, increments)]
+                    loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / score_scale
+                    miss = sum(abs(rate - displayed[count]) for rate, count in zip(rates, earned)) / len(rates)
                     loss_gap = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
                     miss_gap = max(0.0, abs(miss - LAUNCH_PERSISTENCE_MISS) - .005)
                     # Every non-universal rate fell outside the persistence band.
