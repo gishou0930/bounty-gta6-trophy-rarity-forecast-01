@@ -21,6 +21,7 @@ LAUNCH_PLAYER_GROWTH = 3868 / 638
 LAUNCH_EXTRA_UNLOCKS_PER_PLAYER = ((4276 - 3868) - (943 - 638)) / (3868 - 638)
 LAUNCH_REFRESH_HOURS = ((4.08, .25), (4.25, .50), (4.42, .25))
 LAUNCH_PERSISTENCE_LOSS = 1.51
+LAUNCH_PERSISTENCE_MISS = .68
 PERSISTENCE_NORMAL_QUANTILES = (-1.645, -.674, 0, .674, 1.645)
 
 # PS5 release rolled through local midnight, beginning at 11:00 UTC the prior
@@ -216,7 +217,7 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
 
     masses = [defaultdict(float) for _ in rates]
     rng = Random(0)
-    draws = 200
+    draws = 650
     for hour, scenario_mass in scenarios:
         if hour > target:
             for rate, mass in zip(rates, masses):
@@ -238,7 +239,7 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
         refreshed_mass = 0.0
         for full_count, full_mass in full_scenarios:
             remainder = extra - full_count * nonuniversal
-            for partial_share, share_mass in ((.48, .25), (.70, .50), (.88, .25)):
+            for partial_share, share_mass in ((.28, .14), (.48, .24), (.68, .37), (.88, .25)):
                 prior_weight = full_mass * share_mass / draws
                 fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
                 for _ in range(draws):
@@ -246,10 +247,15 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                     earned = [population if fixed else min(population, count + full_count + increase)
                               for count, increase, fixed in zip(initial_counts, increments, universal)]
                     loss = sum(baseline_cost(i, count) for i, count in enumerate(earned)) / (len(rates) * len(levels))
-                    # The published 1.51 was rounded. Retain a small prior mass
-                    # outside that interval for model error in other launches.
-                    distance = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
-                    weight = prior_weight * (.004 + .996 * math.exp(-.5 * (distance / .010) ** 2))
+                    changes = [abs(rate - displayed[count]) for rate, count in zip(rates, earned)]
+                    miss = sum(changes) / len(rates)
+                    loss_gap = max(0.0, abs(loss - LAUNCH_PERSISTENCE_LOSS) - .005)
+                    miss_gap = max(0.0, abs(miss - LAUNCH_PERSISTENCE_MISS) - .005)
+                    # Every non-universal rate fell outside the persistence band.
+                    above_band_floor = any(logits[count] >= persistence[i][0] for i, count in enumerate(earned)
+                                           if not universal[i])
+                    fit = math.exp(-.5 * ((loss_gap / .008) ** 2 + (miss_gap / .004) ** 2))
+                    weight = prior_weight * (.002 + .998 * fit * (.04 if above_band_floor else 1.0))
                     refreshed_mass += weight
                     for mass, count in zip(refreshed, earned):
                         mass[displayed[count]] += weight
