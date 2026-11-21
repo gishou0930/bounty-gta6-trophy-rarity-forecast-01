@@ -24,6 +24,16 @@ LAUNCH_PERSISTENCE_LOSS = 1.51
 LAUNCH_PERSISTENCE_MISS = .68
 PERSISTENCE_NORMAL_QUANTILES = (-1.645, -.674, 0, .674, 1.645)
 
+LAUNCH_LEVELS = (.05, .25, .50, .75, .95)
+# Calibrated on simulated refreshes that meet the published aggregate counts.
+# Rows follow the launch groups: main story, short, medium, long activities.
+LAUNCH_GROUP_LEVELS = (
+    (.02, .285, .50, .68, .95),
+    (.02, .32, .60, .82, .98),
+    (.05, .25, .50, .715, .935),
+    (.065, .25, .50, .68, .90),
+)
+
 # PS5 release rolled through local midnight, beginning at 11:00 UTC the prior
 # day. These weights approximate the early regions represented at the sync.
 REGIONAL_STARTS = ((-13.0, .04), (-10.5, .08), (-8.5, .18), (-5.5, .08),
@@ -351,10 +361,12 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                 mass[rate] += weight * scenario_mass / refreshed_mass
 
     forecasts = []
-    for mass in masses:
+    calibrate = tuple(levels) == LAUNCH_LEVELS
+    for mass, group in zip(masses, groups):
+        probabilities = LAUNCH_GROUP_LEVELS[group] if calibrate else levels
         ordered = sorted(mass)
         cumulative = list(accumulate(mass[rate] for rate in ordered))
-        forecasts.append([ordered[bisect_left(cumulative, level * cumulative[-1])] for level in levels])
+        forecasts.append([ordered[bisect_left(cumulative, level * cumulative[-1])] for level in probabilities])
     return forecasts
 
 
