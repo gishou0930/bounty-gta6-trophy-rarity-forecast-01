@@ -29,7 +29,7 @@ LAUNCH_LEVELS = (.05, .25, .50, .75, .95)
 # Rows follow the launch groups: main story, short, medium, long activities.
 LAUNCH_GROUP_LEVELS = (
     (.02, .285, .50, .68, .95),
-    (.02, .32, .60, .82, .98),
+    (.02, .285, .60, .82, .98),
     (.05, .25, .50, .715, .935),
     (.065, .25, .50, .68, .90),
 )
