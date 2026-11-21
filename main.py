@@ -28,10 +28,10 @@ LAUNCH_LEVELS = (.05, .25, .50, .75, .95)
 # Calibrated on simulated refreshes that meet the published aggregate counts.
 # Rows follow the launch groups: main story, short, medium, long activities.
 LAUNCH_GROUP_LEVELS = (
-    (.02, .285, .50, .68, .95),
-    (.02, .32, .60, .82, .98),
-    (.05, .25, .50, .715, .935),
-    (.065, .25, .50, .68, .90),
+    (.02, .18, .60, .82, .98),
+    (.02, .285, .60, .82, .98),
+    (.02, .18, .40, .785, .965),
+    (.02, .18, .40, .715, .90),
 )
 
 # PS5 release rolled through local midnight, beginning at 11:00 UTC the prior
