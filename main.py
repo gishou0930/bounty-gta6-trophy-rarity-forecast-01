@@ -45,12 +45,32 @@ PROFILE_SCAN_DELAYS = ((.40, .30), (2.20, .45), (4.70, .25))
 STORY_HOURS = {3: 12, 4: 21, 5: 39, 6: 55, 7: 62, 8: 15,
                9: 34, 10: 42, 11: 46, 12: 49, 13: 58}
 
-# A later trophy cannot normally be earned before the named chapter gate.
-CHAPTER_PREREQUISITES = {
-    3: (4, 8, 24, 29, 33, 34, 47, 54, 55),
-    4: (5, 9, 22, 26, 27, 39, 49, 52),
+# Trophy ids map to awards that normally require them, including the
+# completed-story and side-activity requirements for A Long Road.
+UNLOCK_PREREQUISITES = {
+    3: (4, 8, 24, 28, 29, 33, 34, 47, 54, 55),
+    4: (5, 9, 22, 26, 27, 39, 45, 49, 52),
     5: (6, 10, 11, 12, 40),
     6: (7, 13),
+    7: (14,),
+    8: (4,),
+    9: (5,),
+    10: (6,),
+    11: (6,),
+    12: (6,),
+    13: (7,),
+    15: (14,),
+    17: (14,),
+    18: (14,),
+    19: (14,),
+    30: (14,),
+    31: (14,),
+    32: (14,),
+    35: (14,),
+    40: (14,),
+    41: (14, 40),
+    43: (14,),
+    52: (14,),
 }
 
 # Optional trophy priors: effective effort in gameplay hours and the chance of
@@ -275,7 +295,7 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
               for trophy, (effort, _) in zip(trophies, priors)]
     index_by_id = {trophy['id']: i for i, trophy in enumerate(trophies)}
     prerequisites = [(index_by_id[chapter], index_by_id[trophy])
-                     for chapter, dependent in CHAPTER_PREREQUISITES.items()
+                     for chapter, dependent in UNLOCK_PREREQUISITES.items()
                      if chapter in index_by_id
                      for trophy in dependent if trophy in index_by_id]
 
@@ -342,7 +362,7 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                                        if not universal[i])
                 out_of_order = sum(max(0, earned[trophy] - earned[chapter])
                                    for chapter, trophy in prerequisites)
-                fit = math.exp(-.5 * ((loss_gap / .008) ** 2 + (miss_gap / .004) ** 2))
+                fit = math.exp(-.5 * ((loss_gap / .005) ** 2 + (miss_gap / .0025) ** 2))
                 aggregate_fit = .002 + .998 * fit * (.04 if above_band_floor else 1.0)
                 # Keep a small allowance for inconsistent tracker scans.
                 return aggregate_fit, .02 + .98 * math.exp(-1.5 * out_of_order)
