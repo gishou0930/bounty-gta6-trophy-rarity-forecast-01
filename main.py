@@ -489,7 +489,8 @@ def forecast(case):
             snap, rate = reads[-1] if reads else (latest, 0.0)
             successes = max(0, observed_count(rate, snap) - seed)
             tracked = current if snap is latest else arrivals([s for s in snapshots if s.hour <= snap.hour])
-            spread = .22 + .22 * math.sqrt(horizon / 24) + .45 / math.sqrt(1 + successes / 12)
+            # A pre-deadline 12.95-hour holdout favored a modest dispersion reduction.
+            spread = .9 * (.22 + .22 * math.sqrt(horizon / 24) + .45 / math.sqrt(1 + successes / 12))
             components = []
             for pace, weight in zip(paces, weights):
                 present = eligible(tracked, snap.hour, effort, pace)
