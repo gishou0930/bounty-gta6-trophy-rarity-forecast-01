@@ -172,58 +172,35 @@ def trophy_prior(trophy):
     return SIDE_PRIORS.get(trophy_id, fallback)
 
 
-def condition_allocations(shares, total, fit, rng):
-    """Sample a count posterior and measure evidence under the scenario's prior."""
-    active = [i for i, share in enumerate(shares) if share > 0]
-    if total == 0:
-        counts = [0] * len(shares)
-        return fit(counts)[0], [counts]
-    if len(active) == 1:
-        counts = [0] * len(shares)
-        counts[active[0]] = total
-        return fit(counts)[0], [counts]
+def condition_allocations(partial, play, groups, total, partial_share, fit, rng):
+    """Weight paired player cohorts by their fit to the published refresh."""
+    if not total:
+        counts = [0] * len(partial)
+        return fit(counts)[0], [(counts, 1.0)]
 
-    reserve = [math.floor(total * .5 * share) for share in shares]
-    free = total - sum(reserve)
-    relative_weights = [shares[i] for i in active]
-    initial_samples, initial_fit = [], []
-    prior_mass = 0.0
-    for _ in range(256):
-        counts = reserve.copy()
-        for i in rng.choices(active, weights=relative_weights, k=free):
-            counts[i] += 1
-        initial_samples.append(counts)
-        observed_fit, prior_fit = fit(counts)
-        prior_mass += prior_fit
-        initial_fit.append(observed_fit * prior_fit)
+    reviewed = round(total * partial_share)
+    public = total - reviewed
+    indices = range(len(partial))
+    group_masses = [sum(weight for weight, group in zip(partial, groups) if group == group_id)
+                    for group_id in range(max(groups) + 1)]
+    weighted, prior_mass = [], 0.0
+    for _ in range(512):
+        # Allow a batch of early profiles to favor a stage, while keeping
+        # each stage's expected share proportional to the pre-refresh prior.
+        factors = [rng.gammavariate(18 * mass, 1) / mass if mass else 0
+                   for mass in group_masses]
+        profile_weights = [weight * factors[group] for weight, group in zip(partial, groups)]
+        counts = [0] * len(partial)
+        for index in rng.choices(indices, weights=profile_weights, k=reviewed):
+            counts[index] += 1
+        for index in rng.choices(indices, weights=play, k=public):
+            counts[index] += 1
+        observed, coherent = fit(counts)
+        weighted.append((counts, observed * coherent))
+        prior_mass += coherent
 
-    # The chapter constraints belong to the prior over allocations within a
-    # cohort scenario. Normalize that prior before comparing evidence across
-    # different cohort scenarios.
-    evidence = sum(initial_fit) / prior_mass
-    posterior = []
-    for start_index in rng.choices(range(len(initial_samples)), weights=initial_fit, k=8):
-        counts = initial_samples[start_index].copy()
-        current_fit = initial_fit[start_index]
-        for step in range(64):
-            donor, receiver = rng.sample(active, 2)
-            movable = counts[donor] - reserve[donor]
-            if movable:
-                proposal = counts.copy()
-                proposal[donor] -= 1
-                proposal[receiver] += 1
-                observed_fit, prior_fit = fit(proposal)
-                proposed_fit = observed_fit * prior_fit
-                receiver_free = counts[receiver] - reserve[receiver]
-                # The exchange is symmetric. The ratio includes the
-                # multinomial count factors and the published summaries.
-                numerator = proposed_fit * movable * shares[receiver]
-                denominator = current_fit * (receiver_free + 1) * shares[donor]
-                if rng.random() * denominator < numerator:
-                    counts, current_fit = proposal, proposed_fit
-            if step >= 16 and step % 4 == 0:
-                posterior.append(counts)
-    return evidence, posterior
+    mass = sum(weight for _, weight in weighted)
+    return mass / prior_mass, [(counts, weight / mass) for counts, weight in weighted]
 
 
 def aggregate_bounds(costs_by_trophy, total):
@@ -284,6 +261,8 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
     if not any(partial_weights):
         partial_weights = [int(not fixed) for fixed in universal]
     partial_total = sum(partial_weights)
+    groups = [0 if trophy['id'] in STORY_HOURS else 1 + bisect_left((15, 38), effort)
+              for trophy, (effort, _) in zip(trophies, priors)]
     index_by_id = {trophy['id']: i for i, trophy in enumerate(trophies)}
     prerequisites = [(index_by_id[chapter], index_by_id[trophy])
                      for chapter, dependent in CHAPTER_PREREQUISITES.items()
@@ -359,11 +338,11 @@ def launch_quantiles(trophies, rates, universal, priors, players, last_read, tar
                 return aggregate_fit, .02 + .98 * math.exp(-1.5 * out_of_order)
 
             for partial_share, share_mass in ((.28, .14), (.48, .24), (.68, .37), (.88, .25)):
-                fractions = [partial_share * a + (1 - partial_share) * b for a, b in zip(partial, play)]
-                evidence, draws = condition_allocations(fractions, remainder, fit, rng)
-                weight = cohort_mass * share_mass * evidence / len(draws)
-                refreshed_mass += weight * len(draws)
-                for increments in draws:
+                evidence, draws = condition_allocations(partial, play, groups, remainder, partial_share, fit, rng)
+                scenario_weight = cohort_mass * share_mass * evidence
+                refreshed_mass += scenario_weight
+                for increments, conditional_weight in draws:
+                    weight = scenario_weight * conditional_weight
                     earned = [min(population, count + increase) for count, increase in zip(initial, increments)]
                     for mass, count in zip(refreshed, earned):
                         mass[displayed[count]] += weight
